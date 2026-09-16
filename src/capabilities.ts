@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import { readTeamSync, readRetiredMemberIdsSync } from './state.ts'
 import type { TeamState } from './types.ts'
 import { MEMBER_TOOL_NAMES, TEAM_TOOL_NAMES } from './tool-names.ts'
+import { restrictMemberTools } from './members.ts'
 
 export const TEAM_ACTIVATION_PROMPT = 'AgentTeams (Agent Teams) provides multi-agent team collaboration. Apply these rules when the user requests it (including /agent-teams) or when continuing an existing team. Mentioning, quoting, discussing, or declining AgentTeams alone is not a request to start work.'
 export const TEAM_MEMBER_PROMPT = 'You are an AgentTeams member. Follow your assigned member persona and task contract. Use agent_teams_claim_task, agent_teams_update_task, agent_teams_send_message and agent_teams_status for your own work. Include the current attempt_id in updates; report completion or failure to the captain. Do not create, approve, edit or resume a team. If your durable membership is unavailable, report that to the parent instead of creating a replacement.'
@@ -87,9 +88,10 @@ export function installTeamCapabilities(ctx: Context, config: CapabilityConfig):
     states.set(agent, state)
     active.add(state)
     try {
-      if (member) revoke = agent.ctx.tools.restrict({
-        deny: TEAM_TOOL_NAMES.filter(name => !MEMBER_TOOL_NAMES.includes(name)),
-      })
+      if (member) {
+        // Lenient: a composition may not register every denied name (see restrictMemberTools).
+        revoke = restrictMemberTools(agent.ctx, TEAM_TOOL_NAMES.filter(name => !MEMBER_TOOL_NAMES.includes(name)))
+      }
       releaseLifetime = agent.ctx.effect(() => state.dispose, 'agent-teams: capability lifetime')
       return state
     } catch (error) { state.dispose(); throw error }

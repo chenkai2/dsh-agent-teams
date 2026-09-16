@@ -33,6 +33,95 @@ export const PERSONA_PROTOCOL_MAX_CHARS = 400
 const MEMBER_DENIED_TOOLS = CAPTAIN_TOOL_NAMES
 
 /**
+ * Host-owned delegation controls a member may not use when member delegation is forbidden.
+ *
+ * They belong to the composition, which may not register them at all: Agent Teams profiles
+ * and newer `dsh-web-app` layers ship `tool-subagent` and `tool-subagent-control` disabled.
+ * A name the host does not register is a hard `tools.restrict()` error, so these are only
+ * offered when the running composition actually exposes them.
+ */
+const MEMBER_DELEGATION_DENIED_TOOLS: readonly string[] = ['subagent', 'send_message']
+
+/**
+ * Deny list for one member scope: this plugin's captain-only tools, plus the host's own
+ * delegation controls when member delegation is forbidden and the composition registers them.
+ *
+ * The host applies a request's `toolFilter` through the same strict `tools.restrict()` that
+ * rejects an unknown name, so naming an absent host tool aborts the member start. Host names
+ * are therefore resolved against the captain's view first; when that cannot be inspected the
+ * full list is returned and {@link startMemberWithLenientFilter} recovers if it is rejected.
+ * Delegation itself stays capped by {@link installMemberDelegationGuard}, which enforces the
+ * limit against the real ancestor chain.
+ * @param captain - spawning captain; its scope decides which host tools exist.
+ * @param maxDepth - configured member delegation cap.
+ * @returns names to deny for the member scope.
+ */
+export function memberDenyList(captain: Agent, maxDepth: number | undefined): string[] {
+  const candidates = [...MEMBER_DENIED_TOOLS, ...(maxDepth === 0 ? MEMBER_DELEGATION_DENIED_TOOLS : [])]
+  const tools = (captain as { ctx?: { tools?: { get?: (name: string) => unknown } } }).ctx?.tools
+  const lookup = tools?.get
+  if (tools === undefined || typeof lookup !== 'function') return candidates
+  return candidates.filter(name => lookup.call(tools, name) !== undefined)
+}
+
+/** Extract the tool names a `tools.restrict()` rejection reported as unknown. */
+function unknownRestrictedNames(error: unknown): string[] {
+  const message = error instanceof Error ? error.message : String(error)
+  if (!message.includes('unknown global tool')) return []
+  return [...message.matchAll(/"([^"]+)"/g)].map(match => match[1] as string)
+}
+
+/**
+ * Start one member, dropping any deny name the host reports as unknown and retrying.
+ *
+ * The member start is not something a mounting difference may fail: a rejected `toolFilter`
+ * would leave the member without a session for the lifetime of the team. The host names the
+ * offenders in its rejection, so they are removed and the start retried once per rejection.
+ * @param start - performs one start attempt for the given deny list.
+ * @param deny - initial deny list.
+ * @returns the started member.
+ */
+export async function startMemberWithLenientFilter<T>(
+  start: (deny: readonly string[]) => Promise<T>,
+  deny: readonly string[],
+): Promise<T> {
+  let names = [...deny]
+  for (;;) {
+    try {
+      return await start(names)
+    } catch (error: unknown) {
+      const unknown = unknownRestrictedNames(error)
+      const remaining = names.filter(name => !unknown.includes(name))
+      if (unknown.length === 0 || remaining.length === names.length) throw error
+      names = remaining
+    }
+  }
+}
+
+/**
+ * Apply one member capability restriction, dropping names this composition does not register.
+ *
+ * Same contract as {@link startMemberWithLenientFilter} for the restriction that runs when a
+ * member session starts: a member must never be lost to a mounting difference.
+ * @param ctx - scope the restriction applies to (the member agent context).
+ * @param deny - desired deny list.
+ * @returns the disposer that lifts the applied restriction.
+ */
+export function restrictMemberTools(ctx: Context, deny: readonly string[]): () => void {
+  let names = [...deny]
+  for (;;) {
+    try {
+      return ctx.tools.restrict({ deny: names })
+    } catch (error: unknown) {
+      const unknown = unknownRestrictedNames(error)
+      const remaining = names.filter(name => !unknown.includes(name))
+      if (unknown.length === 0 || remaining.length === names.length) throw error
+      names = remaining
+    }
+  }
+}
+
+/**
  * Restore the SessionId brand on a value that round-tripped through the
  * durable team file. The brand is erased by JSON serialization; the value
  * originated from `startContinuable`/`agent.id`, so this cast is the boundary
@@ -628,14 +717,14 @@ export async function spawnMember(
   }
   const label = `${MEMBER_LABEL_PREFIX}${team.id}:${member.name}`
   const start = await selections.withPending(captain.id, label, llmSelection, () => (
-    ctx.subagents.startContinuable({
+    startMemberWithLenientFilter(deny => ctx.subagents.startContinuable({
       provider: config.provider,
       label,
       request: {
         prompt: [{ type: 'text', text: initialPrompt ?? memberWelcome(team, member.name) }],
         parent: captain,
         persona: memberPersona(team, member, stateDir, config.executionPrompt),
-        toolFilter: { deny: [...MEMBER_DENIED_TOOLS, ...(config.maxDepth === 0 ? ['subagent', 'send_message'] : [])] },
+        toolFilter: { deny: [...deny] },
         agentOptions: {
           provider: llmSelection.provider,
           model: llmSelection.model,
@@ -648,7 +737,7 @@ export async function spawnMember(
         // the configured member-relative descendant budget instead.
       },
       signal,
-    })
+    }), memberDenyList(captain, config.maxDepth))
   ))
   member.id = start.childId
 }

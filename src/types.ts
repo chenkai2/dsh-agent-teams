@@ -170,6 +170,11 @@ export interface TeamMember {
   status: MemberStatus
   /** Execution admission is closed while a failed/pending handoff is drained. */
   stopping?: boolean
+  /**
+   * Last member-start failure, recorded so the captain can see why a member never
+   * acquired a session instead of observing an unexplained `unspawned` member.
+   */
+  spawnError?: string
 }
 
 /** One mailbox message. */
